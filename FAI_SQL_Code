@@ -1,4 +1,5 @@
-#########################Step 1: Suspicion of Infection Table Generation#########################
+
+#########################Suspicion of Infection Table Generation#########################
 
 --note this duplicates prescriptions
 -- each ICU stay in the same hospitalization will get a copy of
@@ -164,7 +165,7 @@ LEFT JOIN me_then_ab me2ab
         AND ab_tbl.ab_id = me2ab.ab_id
         AND me2ab.micro_seq = 1
 ;
-#########################Step 2: SOFA Score Generation#########################
+#########################SOFA Score Generation#########################
           
 -- ------------------------------------------------------------------
 -- Title: Sequential Organ Failure Assessment (SOFA)
@@ -528,7 +529,7 @@ WHERE hr >= 0;
 
 
 
-##########################Step 3: Sepsis-3 Table Generation##########################
+##########################Sepsis-3 Table Generation##########################
 
 -- Creates a table with "onset" time of Sepsis-3 in the ICU.
 -- That is, the earliest time at which a patient had SOFA >= 2
@@ -611,524 +612,29 @@ FROM s1
 WHERE rn_sus = 1;
 
 
+     ##########################Bring Hospital Admission ID into Table (allows link to ICD diagnosis codes)##########################
+#Also pulling in ICU admit/discharge time & LOS#
 
-           
-##########################Step 4: Dong et al. Fluid Balance Code##########################
-    
---code in this step comes from Supplemental Material found in the following article by Dong et al.:
---https://www.frontiersin.org/journals/medicine/articles/10.3389/fmed.2022.714384/full#supplementary-material--
-CREATE OR REPLACE TABLE `mimic-iv-ext-2025.FAI_Sepsis.septic_patients_fluid_balance` AS 
-with t1 as --t1 is inputevents_mv within 2 days after admission
-(select p1.stay_id, --change to stay_id, rather than icustay_id--
-        p1.starttime, --change from charttime to starttime--
-        p1.itemid,
-        --p1.label, not present in inputevents table--
-        p1.amountuom,
-        p1.ordercategoryname,
-        p1.secondaryordercategoryname,
-        round(case 
-        when p1.amountuom = 'L' then p1.amount*1000
-        when p1.amountuom = 'ml' then p1.amount
-        else null end) as amount 
-      from `physionet-data.mimiciv_3_1_icu.inputevents` p1 --changed to inputevents dataset--
-       left join `physionet-data.mimiciv_3_1_icu.icustays` p2
-     on p1.stay_id = p2.stay_id 
-     where p1.starttime between p2.intime and (DATETIME_ADD(p2.intime,interval '2' DAY)) --changed charttime to starttime--
-),
-t2 as --t2 is inputevents_cv within 2 days after admission
-(
-select p1.stay_id,itemid,amount from `physionet-data.mimiciv_3_1_icu.inputevents` p1
-       left join `physionet-data.mimiciv_3_1_icu.icustays` p2
-     on p1.stay_id = p2.stay_id 
-     where p1.starttime between p2.intime and (DATETIME_ADD(p2.intime,interval '2' DAY))
-),
-t3 as  --t3 is outputevents within 2 days after admission
-(select tmp.stay_id,tmp.charttime,tmp.itemid,tmp.label,tmp.value from
-  (select p1.stay_id,
-        p1.charttime,
-        p1.itemid,
-        p2.label,
-        p1.value
-       from `physionet-data.mimiciv_3_1_icu.outputevents` p1
-       left join `physionet-data.mimiciv_3_1_icu.d_items` p2
-     on p1.itemid = p2.itemid
-     ) tmp
-    left join `physionet-data.mimiciv_3_1_icu.icustays` p3
-    on p3.stay_id = tmp.stay_id
-    where (tmp.charttime between p3.intime and (DATETIME_ADD(p3.intime,interval '2' DAY)) --within 2 days after admission
-          and tmp.stay_id in (select stay_id from `mimic-iv-ext-2025.FAI_Sepsis.sepsis3`)) --select septic patients
- ),
-inev as(
-select stay_id, 
-       sum(case
-       when t1.itemid in (225943, --  Solution
-                  225158, -- NaCl 0.9%
-                  225828, -- LR
-                  225944, -- Sterile Water
-                  225797, -- Free Water
-                              225159, -- NaCl 0.45%
-                              225161, -- NaCl 3% (Hypertonic Saline)
-                              225823, -- D5 1/2NS
-                              225825, -- D5NS
-                              225827, -- D5LR
-                              225941, -- D5 1/4NS
-                              226089 -- Piggyback
-       ) then amount *1
-         else amount * 0 end) as cryst,--1
-     sum( case
-       when t1.itemid in (220864, --  Albumin 5%  7466 132 7466
-                                           220862, -- Albumin 25% 9851 174 9851
-                                           225174, -- Hetastarch (Hespan) 6%  82 1 82
-                                           225795, -- Dextran 40  38 3 38
-                                           225796  --  Dextran 70
-                                           -- below ITEMIDs not in use
-                                           --220861, --   Albumin (Human) 20%
-                                           --220863, --   Albumin (Human) 4%
-       ) then amount *1
-         else amount * 0 end) as colloids,--2
-     sum(case
-       when t1.itemid in (225168,-- Packed Red Blood Cells
-                                --225170,-- Platelets
-                                --225171,-- Cryoprecipitate
-                                225173--  Cell Saver
-                --227532 -- Plasma Pheresis
-                ) then amount *1
-         else amount * 0 end) as rbc,--3
-    sum(case
-       when t1.itemid in (--225168,-- Packed Red Blood Cells
-                                --225170,-- Platelets
-                                --225171,-- Cryoprecipitate
-                                --225173,-- Cell Saver
-                227532 -- Plasma Pheresis
-                ) then amount *1
-         else amount * 0 end) as plasma,--4
-    sum(case
-       when t1.itemid in (--225168,-- Packed Red Blood Cells
-                                225170--  Platelets
-                                --225171,-- Cryoprecipitate
-                                --225173,-- Cell Saver
-                --227532 -- Plasma Pheresis
-                ) then amount *1
-         else amount * 0 end) as plt,--5
-    sum(case
-       when t1.itemid in (225916,-- TPN w/ Lipids
-                225935,-- Replete (Full)
-                225936,-- Replete with Fiber (Full)
-                226880,-- Nutren Pulmonary (Full)
-                226452,-- PO Intake
-                225799,-- Gastric Meds
-                227695 -- Fibersource HN (Full)
-                                ) then amount *1
-         else amount * 0 end) as oral,--6
-    sum(case
-       when (t1.ordercategoryname not in ('16-Pre Admission') 
-                     and t1.itemid not in (227529)  --ACD-A Citrate (1000ml)
-                                 ) then amount *1
-         else amount * 0 end) as total_in--7
-     from t1 group by t1.stay_id
-UNION DISTINCT
---calculate inputevents mv classified as cryst,colloids,blood,total
-select stay_id,
-       sum(case
-       when t2.itemid in (30013,--D5W 
-                                30018,--.9% Normal Saline 
-                30021,--Lactated Ringers
-                30015,--D5/.45NS
-                30020,--.45% Normal Saline
-                30187,--D10W
-                30032,--TPN
-                30060,--D5NS
-                30196,--  TPN D10.0
-                30321,--  .45NS + .5:1 Heparin
-                30191,--  TPN D5.0
-                30028,--  MVI
-                30016,--  Dextrose 10%
-                30101,--  OR Crystalloid
-                30096,--  TPN w/Lipids
-                30150,--  Fentanyl Base
-                30061,--  D5RL
-                30065,--  Sterile Water
-                30058,--  Free Water Bolus
-                30208,--  Lipids 20%
-                30160,--  D5 Normal Saline
-                30353,--  0.45% Normal Saline
-                30193,--  TPN D7.5
-                30143,--  3% Normal Saline
-                30301,--  TPN D8
-                41101,--  Protonix
-                30099,--  PPN
-                30159,--  D5 Ringers Lact.
-                30190,--  NS .9%
-                30069,--  --Solumedrol 甲强龙
-                41583,--  pantoprazole
-                40549,--  protonix
-                30199,--  TPN D12.5
-                30197,--  TPN D11.0
-                30189,--  D7.5W
-                30325,--  TPN D13.0
-                30186,--  .45NS + 1:1 Heparin
-                44008,--  PROTONIX 泮托
-                30194,--  TPN D9.0
-                30317,--  D 12.5 W
-                30318,--  D15W
-                30014,--  D5/.2NS
-                30352,--  0.9% Normal Saline
-                30323,--  TPN D6
-                30063,--  IV Piggyback
-                42999 --  Sodium Bicarb
-                          ) then amount *1
-         else amount * 0 end) as cryst,--1
-     sum( case
-       when t2.itemid in (30009,--    Albumin 25%
-                30102,--  OR Colloid
-                30008,--  Albumin 5%
-                30012,--  Hespan
-                30011 --  Dextran 40                          
-                         ) then amount *1
-         else amount * 0 end) as colloids,--2
-     sum(case
-       when t2.itemid in (30001,--     Packed RBC's
-                --30005,--     Fresh Frozen Plasma
-                --30006,--    Platelets
-                --30104,--    OR Packed RBC's
-                --30103,--  OR FFP
-                --30007,--  Cryoprecipitate
-                --30105,--  OR Platelets
-                30179 --  PRBC's                          
-                          ) then amount *1
-         else amount * 0 end) as rbc,--3
-      sum(case
-       when t2.itemid in (--30001,--     Packed RBC's
-                30005--     Fresh Frozen Plasma
-                --30006,--    Platelets
-                --30104,--    OR Packed RBC's
-                --30103,--  OR FFP
-                --30007,--  Cryoprecipitate
-                --30105,--  OR Platelets
-                --30179 --  PRBC's                          
-                          ) then amount *1
-         else amount * 0 end) as plasma,--4
-    sum(case
-       when t2.itemid in (--30001,--     Packed RBC's
-                --30005,--     Fresh Frozen Plasma
-                30006--    Platelets
-                --30104,--    OR Packed RBC's
-                --30103,--  OR FFP
-                --30007,--  Cryoprecipitate
-                --30105,--  OR Platelets
-                --30179 --  PRBC's                          
-                          ) then amount *1
-         else amount * 0 end) as plt,--5
-    sum(case
-       when t2.itemid in (30056,--Po Intake
-                30144,--     Gastric Meds
-                30166, --    Promote w/fiber
-                30073,--  Impact w/fiber
-                30354,--  ProBalance
-                30077,--  Nepro
-                30090,--  Tube Feeding
-                30088,--  Replete w/fiber
-                30165,--  Promote 
-                30078,--  Respalor
-                30404,--  Nutren Pulmonary
-                30403,--  Nutren Renal
-                30086,--  Ultracal
-                30072,--  Peptamen
-                30221,--  Br Milk FS NG
-                30075,--  Deliver 2.0
-                45151,--  Pulmonary
-                30036  -- Ensure       
-                          ) then amount *1
-         else amount * 0 end) as oral,--6
-    sum(case
-       when t2.itemid not in (30054,--  Pre-Admission Intake
-                  30055,--  Cath Lab Intake
-                    30108,--  PACU Crystalloids
-                    44547,--  intrathecal catheter
-                  42217,--  peritoneal fluid
-                  42038,--    er crystalloid
-                  44276,--  ER IV fluid
-                  42322,--  er crystalloids
-                  42876,--  ER CRYSTALLOIDS
-                  46684,--  ER FFP
-                  42058,--  ER INTAKE
-                  41368,--  er ivf
-                  42102,--  ER U/O
-                  44986,--  PACU intake) then amount *1
-                  30140,--    N/A
-                  30059--    GU flush
-                  ) then amount *1
-         else amount * 0 end) as total_in--7
-     from t2 group by stay_id
-    ),
-outev as (
-----outputevents
-select t3.stay_id,
-       sum(case
-       when t3.itemid in (
-         -- these are the most frequently occurring urine output observations in CareVue
-  40055, -- "Urine Out Foley"
-  43175, -- "Urine ."
-  40069, -- "Urine Out Void"
-  40094, -- "Urine Out Condom Cath"
-  40715, -- "Urine Out Suprapubic"
-  40473, -- "Urine Out IleoConduit"
-  40085, -- "Urine Out Incontinent"
-  40057, -- "Urine Out Rt Nephrostomy"
-  40056, -- "Urine Out Lt Nephrostomy"
-  40405, -- "Urine Out Other"
-  40428, -- "Urine Out Straight Cath"
-  40086,--  Urine Out Incontinent
-  40096, -- "Urine Out Ureteral Stent #1"
-  40651, -- "Urine Out Ureteral Stent #2"
-  -- these are the most frequently occurring urine output observations in MetaVision
-  226559, -- "Foley"
-  226560, -- "Void"
-  226561, -- "Condom Cath"
-  226584, -- "Ileoconduit"
-  226563, -- "Suprapubic"
-  226564, -- "R Nephrostomy"
-  226565, -- "L Nephrostomy"
-  226567, --  Straight Cath
-  226557, -- R Ureteral Stent
-  226558 -- L Ureteral Stent
-  --227488, -- GU Irrigant Volume In
-  --227489  -- GU Irrigant/Urine Volume Out
-                          ) then value *1
-         else value * 0 end) as urine,
-     sum( case
-       when t3.itemid in (40076,--  Chest Tubes CTICU CT 1
-                226588,-- Chest Tube #1
-                40071,--  Drain Out #1 Jackson Pratt
-                40049,--  Chest Tubes Right Pleural 1
-                40048,--  Chest Tubes Left Pleural 1
-                226599,-- Jackson Pratt #1
-                226589,-- Chest Tube #2
-                40072,--  Drain Out #2 Jackson Pratt
-                41707,--  Chest Tubes CTICU CT 2
-                40294,--  Drain Out #1 Other
-                40926,--  Drain Out #1 JP Medial
-                226600,-- Jackson Pratt #2
-                40091,--  Chest Tubes Mediastinal
-                40088,--  Drain Out #3 Jackson Pratt
-                40050,--  Chest Tubes Right Pleural 2
-                41683,--  Drain Out #2 JP Lateral
-                40090,--  Chest Tubes Left Pleural 2
-                227701,-- Drainage Bag
-                226597,-- JP Medial
-                226598,-- JP Lateral
-                226590,-- L Pleural #1
-                40075,--  Drain Out #1 Pigtail
-                226593,-- R Pleural #1
-                226619,-- Pigtail #1
-                40703,--  Drain Out #1 JP Lateral
-                226592,-- Mediastinal 
-                226563,-- Suprapubic
-                226601,-- Jackson Pratt #3
-                40089,--  Drain Out #1 Wound Vac
-                41898,--  Drain Out #3 T Tube 
-                41867,--  Drain Out #1 Lumbar
-                226610,-- Drain Out #1 Lumbar
-                40080,--  Drain Out #2 Other
-                40092,--  Drain Out #4 Jackson Pratt
-                40084,--  Chest Tubes Other
-                40086,--  Drain Out #2 Pigtail
-                42871,--  Drain Out #2 JP Medial
-                226603,-- T Tube
-                40093,--  Drain Out #1 T Tube
-                40648,--  Drain Out #3 Other
-                226620,-- Pigtail #2
-                40292,--  Drain Out #2 T Tube
-                42278,--  Drain Out #3 Pigtail
-                226602,-- Jackson Pratt #4
-                40077,--  Drain Out #1 Pericardial
-                226604,-- Hemovac #1
-                43178,--  Repogle Tube OGT
-                40290,--  Drain Out #4 Pigtail
-                40095,--  Drain Out #2 Wound Vac
-                226614,-- Wound Vac #2
-                42367,--  Drain Out #3 Sump
-                226567,-- Straight Cath
-                226595,-- R Pleural #2
-                226591,-- L Pleural #2
-                41698,--  Drain Out #2 Hemovac
-                40470,--  paracentesis
-                42738,--  Drain Out #4 Wound Vac
-                40066,--  Drain Out #1 Tap
-                226617,-- Sump #1
-                42582,--  Drain Out #5 T Tube
-                42945,--  Drain Out #3 JP Lateral
-                42405,--  Drain Out #3 Wound Vac
-                42279,--  Drain Out #5 Pigtail
-                41213,--  Drain Out #5 Jackson Pratt
-                42780,--  Drain Out #5 Wound Vac
-                42823,--  Drain Out #7 Jackson Pratt
-                42824,--  Drain Out #8 Jackson Pratt
-                226605,-- Hemovac #2
-                226612,-- Pericardial
-                226623,-- Penrose #1
-                40538,--  Drain Out #2 Sump
-                40554,--  Drain Out #1 Sump
-                40287,--  Drain Out #4 Other
-                42819,--  R pleural CT # 2
-                40956,--  paracentesis site
-                40098,--  Drain Out #1 Penrose
-                42788,--  Drain Out #4 T Tube
-                43177,--  Chest Tubes Chest Tube
-                44174,--  t tube
-                40403,--  thoracentesis
-                42330,--  Drain Out #3 Hemovac
-                43694,--  Drain Out #4 JP Medial
-                45121,--  Penrose drains
-                46478,--  JP #1
-                226618,-- Sump #2
-                42652,--  Drain Out #5 Sump
-                40083,--  Drain Out #5 Other
-                45357,--  JP 5 and JP 6 sxn
-                40451,--  Paracentesis
-                40893 --  Thoracentesis
-                         ) then value *1
-         else value * 0 end) as drainge,
-     sum(case
-       when t3.itemid in (40286,--  Ultrafiltrate Ultrafiltrate
-                44890,--  ultrafiltrate
-                40624,--  dialysis
-                40881,--  Hemodialysis
-                40386,--  hemodialysis
-                46622,--  ultrafiltrate out
-                40745,--  Dialysis
-                40425,--  dialysis output
-                44216,--  Hemodialysis out
-                41016,--  hemodialysis out
-                41527,--  HEMODIALYSIS
-                41250,--  HEMODIALYSIS OUT
-                40690,--  DIALYSIS
-                40613,--  DIALYSIS OUT
-                41635,--  Hemodialysis removal
-                40426,--  dialysis out
-                40507,--  Dialysis out
-                41374,--  Dialysis Out
-                44193,--  Dialysis.
-                43098,--  hemodialysis crystal
-                41842,--  Dialysis Output.
-                43703,--  ULTRAFILTRATE
-                41112,--  Dialysys out
-                41500,--  hemodialysis output
-                44453,--  dyalysis out put
-                44085,--  DIALYSIS OFF
-                46464,--  Hemodialysis OUT
-                41809,--  HD OUT
-                41829,--  HEMODIALYSIS OUTPUT
-                46464,--  Hemodialysis OUT
-                46473,--  HD Ultrafiltrate
-                41634 --  HD Output
-                          ) then value *1
-         else value * 0 end) as dialysis,
-    sum(case
-       when t3.itemid in (40052,--  Gastric Nasogastric
-                40059,--  Gastric Oral Gastric
-                226575,-- Nasogastric
-                226576,-- Oral Gastric
-                40051,--  Gastric Gastric Tube
-                226573,-- Gastric Tube
-                40067,--  Gastric Emesis
-                226571,-- Emesis
-                40331,--  Gastric Jejunostomy Tube
-                226584,-- Ileoconduit
-                226574,-- Jejunostomy
-                43433,--  Ostomies Ileostomy
-                40406,--  Gastric Other
-                40652 --  Gastric Blakemore
-                          ) then value *1
-         else value * 0 end) as gastric,
-    sum(case
-       when t3.itemid not in (
- -- CathLab Output
-                 226632,--  Cath Lab
-                 40612,-- cath lab out
-                 43685,-- Cath Lab Out
-                 40580,-- Cath Lab Output
-                 40848,-- CATH LAB OUTPUT
-                 40973,-- cath lab output
-                 46456,-- Cath lab output
-                 42463,-- cath lab urine
-                 42362,-- CATH LAB URINE OUTPT
-                 40972,-- CathLab Output
-                         42666,-- E.R. URINE OUT
-                 226626,--  OR EBL
-                 44157,-- OR EMESIS
-                 44671,-- OR NGT
-                 44884,-- or ngt
-                 46334,-- OR Out
-                 46735,-- OR out ascites
-                 40064,-- OR Out EBL
-                 46695,-- OR Out OGT
-                 40061,-- OR Out OR Urine
-                 40065,-- OR Out PACU Urine
-                 45992,-- OR Stool/NGT
-                 226627,--  OR Urine
-                 45266,-- OR washout
-                 226628,--  PACU Drains
-                 226629,--  PACU EBL
-                 42499,-- PACU EMESIS
-                 226630,--  PACU Gastric
-                 43064,-- PACU ngt out
-                 45411,-- PACU Out
-                 40491,-- PACU Out EBL
-                 40073,-- PACU Out PACU Drains
-                 40074,-- PACU Out PACU NG
-                 40288,-- PACU Out PACU Urine
-                 44988,-- PACU output
-                 226631,--  PACU Urine
-                 43396,-- Spit
-                 43491,-- SPIT
-                 43245,-- Spits
-                 43323,-- spits
-                 41670,-- stool
-                 226579,--  Stool
-                 43174,-- Stool .
-                 44266,-- Stool out
-                 40388,-- Stool Out (non-specific)
-                 40087,-- Stool Out Colostomy
-                 40053,-- Stool Out Fecal Bag
-                 40063,-- Stool Out Ileostomy
-                 40289,-- Stool Out Ostomy
-                 40068,-- Stool Out Other
-                 40367,-- Stool Out Rectal Tube
-                 40054, --  Stool Out Stool 
-                         227488, -- GU Irrigant Volume In
-                         227489  -- GU Irrigant/Urine Volume Out
-                   ) then value *1
-         else value * 0 end) as total_out
-     from t3 group by stay_id 
-  )
-select p1.stay_id,cryst,colloids,rbc,plasma,plt,oral,total_in,urine,drainge,dialysis,gastric,total_out,total_in-total_out as fb from inev p1
- join outev p2
- on p1.stay_id = p2.stay_id;
-
-
-
-##########################Step 5: Bring Hospital Admission ID into Table (allows link to ICD diagnosis codes)##########################
-#Also pulling in ICU admit time & LOS#
-
-CREATE OR REPLACE TABLE `mimic-iv-ext-2025.FAI_Sepsis.septic_patients_fluid_balance_hadm` AS 
-SELECT s.*, h.hadm_id, h.subject_id, h.intime, h.los
-FROM `mimic-iv-ext-2025.FAI_Sepsis.septic_patients_fluid_balance` s
+CREATE OR REPLACE TABLE `mimic-iv-ext-2025.FAI_Sepsis.septic_patients` AS 
+SELECT s.*, h.hadm_id, h.subject_id, h.intime, h.outtime,  h.los
+FROM `mimic-iv-ext-2025.FAI_Sepsis.sepsis3` s
 INNER JOIN `physionet-data.mimiciv_3_1_icu.icustays` h
 ON s.stay_id = h.stay_id;
+
+
 SELECT COUNT(DISTINCT stay_id) AS n_stays,
        COUNT (DISTINCT hadm_id) AS n_hadm,
        COUNT (DISTINCT subject_id) AS n_subjects
-FROM `mimic-iv-ext-2025.FAI_Sepsis.septic_patients_fluid_balance_hadm`;
-
+FROM `mimic-iv-ext-2025.FAI_Sepsis.septic_patients`;
 
 
 
            
-##########################Step 6: Restrict Septic Population to those with HFrEF & Limiting to First Hospitalization##########################
+##########################Restrict Septic Population to those with HFrEF & Limiting to First Hospitalization##########################
 
 
---After running the Dong et al. query to pull fluid balance for septic patients, identify those with heart failure with reduced ejection fraction--
+--Identify those with heart failure with reduced ejection fraction--
+
 SELECT *
 FROM `physionet-data.mimiciv_3_1_hosp.d_icd_diagnoses`
 WHERE icd_version= 10 AND (LOWER(long_title) LIKE '%heart%disease%' OR LOWER(long_title) LIKE '%heart%failure%' OR LOWER(long_title) LIKE '%cardiomyopathy%');
@@ -1137,15 +643,19 @@ FROM `physionet-data.mimiciv_3_1_hosp.d_icd_diagnoses`
 WHERE LOWER(icd_code) IN (
 "42820","42821","42822","42823","42840","42841","42842","42843","i502","i5020","i5021","i5022","i5023","i504","i5040",
 "i5041","i5042","i5043", "i5084");
+
+
 CREATE OR REPLACE TABLE `mimic-iv-ext-2025.FAI_Sepsis.septic_hfref_full` AS 
 SELECT s.*
-FROM `mimic-iv-ext-2025.FAI_Sepsis.septic_patients_fluid_balance_hadm` s
+FROM `mimic-iv-ext-2025.FAI_Sepsis.septic_patients` s
 WHERE s.hadm_id IN
 (SELECT DISTINCT d.hadm_id
 FROM `physionet-data.mimiciv_3_1_hosp.diagnoses_icd` d       
 WHERE  LOWER(icd_code) IN (
 "42820","42821","42822","42823","42840","42841","42842","42843","i502","i5020","i5021","i5022","i5023","i504","i5040",
 "i5041","i5042","i5043", "i5084"));
+
+
 SELECT COUNT (DISTINCT subject_id) AS n_pts,
        COUNT (DISTINCT hadm_id) AS n_hadm,
        COUNT (DISTINCT stay_id) AS n_icustays
@@ -1166,7 +676,7 @@ FROM (
 WHERE first_appearance=1;
 
 
-##########################Step 7: Bringing in Outcomes (In-Hospital Mortality, AKI, CRRT)##########################
+##########################Bringing in Outcomes (In-Hospital Mortality, AKI, CRRT)##########################
 
 --------------------------------------------MERGING IN-HOSPITAL MORTALITY DATA--------------------------------------------------
 CREATE OR REPLACE TABLE `mimic-iv-ext-2025.FAI_Sepsis.septic_hfref_full_2` AS
@@ -1285,13 +795,14 @@ ON a.stay_id = b.stay_id;
 
 
 ----------------------------------------------DEFINING CRRT OUTCOME -----------------------------------------------------
---Editing table to keep one observation per patient (reducing storage requirements). At this time, we aren't interested in the measurements themselves, just whether or not the patient had an AKI--
+--Editing table to keep one observation per patient. At this time, we aren't interested in the measurements themselves, just whether or not the patient had an AKI--
 CREATE OR REPLACE TABLE `mimic-iv-ext-2025.FAI_Sepsis.septic_hfref_full_10` AS
 SELECT * 
   FROM (
       SELECT s.*, ROW_NUMBER() OVER ( 
         PARTITION BY s.stay_id ORDER BY s.stay_id) AS rn FROM `mimic-iv-ext-2025.FAI_Sepsis.septic_hfref_full_9` s ) 
         WHERE rn = 1; 
+
 --Creating a table that merges in CRRT KDIGO score and CRRT KDIGO time for each patient--
 CREATE OR REPLACE TABLE `mimic-iv-ext-2025.FAI_Sepsis.septic_hfref_full_11` AS
 SELECT s.*, k.aki_stage_crrt, k.charttime AS charttime_kdigo_crrt
@@ -1320,6 +831,8 @@ SELECT a.stay_id,
     AS CRRT_days_3_through_7_admission,
   FROM `mimic-iv-ext-2025.FAI_Sepsis.septic_hfref_full_11` a 
   GROUP BY a.stay_id;
+
+
 CREATE OR REPLACE TABLE `mimic-iv-ext-2025.FAI_Sepsis.septic_hfref_full_12` AS 
 SELECT a.*, b.CRRT_days_3_through_7_admission
 FROM `mimic-iv-ext-2025.FAI_Sepsis.septic_hfref_full_11` a
@@ -1328,7 +841,7 @@ ON a.stay_id = b.stay_id;
 
 
 
-##########################Step 8: Creating a flag for prior AKI##########################
+##########################Creating a flag for prior AKI##########################
 
 --Checking to see if patients in our study population have had an AKI prior to admission of interest--
 --Note that this will only capture prior AKIs that have occurred at BIDMC during the timeframe of MIMIC data collection--
@@ -1360,6 +873,7 @@ SELECT a.subject_id,
   LEFT JOIN `physionet-data.mimiciv_3_1_derived.kdigo_stages` b
     ON a.subject_id = b.subject_id
   GROUP BY a.subject_id;
+
 CREATE OR REPLACE TABLE `mimic-iv-ext-2025.FAI_Sepsis.septic_hfref_full_13` AS
 SELECT a.*, b.prior_AKI_flag
   FROM `mimic-iv-ext-2025.FAI_Sepsis.septic_hfref_full_12` a 
@@ -1369,6 +883,7 @@ SELECT a.*, b.prior_AKI_flag
 
 
 --Editing the final table to keep only the first observation for each patient. At this time, we aren't interested in the measurements themselves, just whether or not the patient received CRRT (the syntax pulled every instance of CRRT for each patient, we just need the Y/N summary of that data)--
+
 CREATE OR REPLACE TABLE `mimic-iv-ext-2025.FAI_Sepsis.septic_hfref_full_14` AS
 SELECT * 
   FROM (
@@ -1379,16 +894,19 @@ SELECT *
 
 
 
-##########################Step 9: Severity of illness and comorbidity scores##########################
+##########################Severity of illness and comorbidity scores##########################
 
 --Pulling in data on severity of illness/comorbidity score (SOFA, Charlson comorbidity index, and APS III)--
+
 --Charlson comorbidity index--
+
 CREATE OR REPLACE TABLE `mimic-iv-ext-2025.FAI_Sepsis.septic_hfref_full_15` AS
 SELECT s.*, c.charlson_comorbidity_index
 FROM `mimic-iv-ext-2025.FAI_Sepsis.septic_hfref_full_14` s
 LEFT JOIN
 `physionet-data.mimiciv_3_1_derived.charlson` c
 ON s.hadm_id = c.hadm_id;
+
 --APS II--
 CREATE OR REPLACE TABLE `mimic-iv-ext-2025.FAI_Sepsis.septic_hfref_full_16` AS
 SELECT s.*,a.apsiii, a.apsiii_prob
@@ -1396,6 +914,7 @@ FROM `mimic-iv-ext-2025.FAI_Sepsis.septic_hfref_full_15` s
 LEFT JOIN
 `physionet-data.mimiciv_3_1_derived.apsiii` a
 ON s.stay_id = a.stay_id;
+
 --SOFA score--
 --Need to first pivot the SOFA scores table so we have one row per patient, and then join this to our main dataset--
 CREATE OR REPLACE TABLE  `mimic-iv-ext-2025.FAI_Sepsis.septic_hfref_full_17` AS
@@ -1415,7 +934,7 @@ WITH sofa_restructured AS(
               WHEN hr= 143 THEN sofa_24hours END) AS day6_sofa,
            MAX(CASE  
               WHEN hr= 167 THEN sofa_24hours END) AS day7_sofa
-    FROM `mimic-iv-ext-2025.FAI_Sepsis.sofa` --table created in step 2--
+    FROM `mimic-iv-ext-2025.FAI_Sepsis.sofa`
     GROUP BY stay_id)
 SELECT 
   s.*, sofa.day1_sofa, sofa.day2_sofa, sofa.day3_sofa, sofa.day4_sofa, sofa.day5_sofa, sofa.day6_sofa, sofa.day7_sofa
@@ -1913,6 +1432,7 @@ SELECT s.subject_id, s.hadm_id, s.stay_id
     , admissiontype_score
 FROM score s
 ;
+
 --Merge--
 CREATE OR REPLACE TABLE  `mimic-iv-ext-2025.FAI_Sepsis.septic_hfref_full_18` AS
 SELECT s.*, saps.sapsii, saps.sapsii_prob
@@ -1921,7 +1441,7 @@ SELECT s.*, saps.sapsii, saps.sapsii_prob
             ON s.stay_id = saps.stay_id;
 
 
-##########################Step 10: Further sepsis definition##########################
+##########################Further sepsis definition##########################
 
 --Pulling ICD-9 and -10 codes for sepsis--
 SELECT *
@@ -1962,6 +1482,8 @@ WHERE s.subject_id IN (
       FROM `mimic-iv-ext-2025.FAI_Sepsis.sepsis3` sep
         WHERE (sep.suspected_infection_time BETWEEN s.intime AND s.admitted_48_hrs)
           AND (sep.sofa_time BETWEEN s.intime AND s.admitted_48_hrs));
+
+
 CREATE OR REPLACE TABLE `mimic-iv-ext-2025.FAI_Sepsis.septic_hfref_full_21` AS
 SELECT s.*, sep.suspected_infection_time AS susp_infection_time_sepdx, sep.sofa_time AS sofa_time_sepdx
 FROM `mimic-iv-ext-2025.FAI_Sepsis.septic_hfref_full_20` s
@@ -1972,7 +1494,7 @@ FROM `mimic-iv-ext-2025.FAI_Sepsis.septic_hfref_full_20` s
 
 
 
-##########################Step 11: Bringing in demographics##########################
+##########################Bringing in demographics##########################
 
 --Race--
 CREATE OR REPLACE TABLE `mimic-iv-ext-2025.FAI_Sepsis.septic_hfref_full_22` AS
@@ -1980,12 +1502,14 @@ CREATE OR REPLACE TABLE `mimic-iv-ext-2025.FAI_Sepsis.septic_hfref_full_22` AS
     FROM `mimic-iv-ext-2025.FAI_Sepsis.septic_hfref_full_21` s
       LEFT JOIN `physionet-data.mimiciv_3_1_hosp.admissions` a
         ON s.hadm_id = a.hadm_id;
+
 --Age--
 CREATE OR REPLACE TABLE `mimic-iv-ext-2025.FAI_Sepsis.septic_hfref_full_23` AS
   SELECT s.*, a.age
     FROM `mimic-iv-ext-2025.FAI_Sepsis.septic_hfref_full_22` s
       LEFT JOIN `physionet-data.mimiciv_3_1_derived.age` a
         ON s.hadm_id = a.hadm_id;
+
 --Gender--
 CREATE OR REPLACE TABLE `mimic-iv-ext-2025.FAI_Sepsis.septic_hfref_full_24` AS
 SELECT s.*, p.gender
@@ -2027,28 +1551,13 @@ SELECT s.*, w.weight AS average_d1_weight, w.weight_admit AS icuadmit_weight, w.
     LEFT JOIN `mimic-iv-ext-2025.FAI_Sepsis.admitweight` w
       ON s.stay_id = w.stay_id;
 
-##########################Step 12: Bringing in vasopressor frequencies##########################
+##########################Bringing in vasopressor frequencies##########################
 
---Need to create table for vasopressin (only pressor not present in the derived module)--
---https://github.com/MIT-LCP/mimic-code/blob/main/mimic-iv/concepts/medication/vasopressin.sql--
-CREATE OR REPLACE TABLE `mimic-iv-ext-2025.FAI_Sepsis.vasopressin_alldata` AS
-SELECT
-    stay_id, linkorderid
-    -- three rows in units/min, rest in units/hour
-    -- the three rows in units/min look reasonable and
-    -- fit with the patient course
-    -- convert all rows to units/hour
-    , CASE WHEN rateuom = 'units/min' THEN rate * 60.0
-        ELSE rate END AS vaso_rate
-    , amount AS vaso_amount
-    , starttime
-    , endtime
-FROM `physionet-data.mimiciv_3_1_icu.inputevents`
-WHERE itemid = 222315; -- vasopressin
 --Previously created flags for one, two, and seven days admitted. Need to generate flags for 3, 4, 5, 6 days admitted--
 CREATE OR REPLACE TABLE `mimic-iv-ext-2025.FAI_Sepsis.septic_hfref_full_26` AS
 SELECT *, DATETIME_ADD(intime, INTERVAL 3 DAY) AS threedays_admitted, DATETIME_ADD(intime, INTERVAL 4 DAY) AS fourdays_admitted, DATETIME_ADD(intime, INTERVAL 5 DAY) AS fivedays_admitted, DATETIME_ADD(intime, INTERVAL 6 DAY) AS sixdays_admitted
 FROM `mimic-iv-ext-2025.FAI_Sepsis.septic_hfref_full_25`;
+
 --For each of the pressors, determine if the patient received them on days 1 - 7 (Y/N)-- 
 CREATE OR REPLACE TABLE `mimic-iv-ext-2025.FAI_Sepsis.dobutamine` AS
 WITH dobutamine AS(
@@ -2184,7 +1693,7 @@ GROUP BY ne.stay_id;
 CREATE OR REPLACE TABLE `mimic-iv-ext-2025.FAI_Sepsis.vasopressin` AS
 WITH vasopressin AS(
     SELECT s.*,v.starttime, v.endtime
-      FROM `mimic-iv-ext-2025.FAI_Sepsis.vasopressin_alldata` v
+      FROM `physionet-data.mimiciv_3_1_derived.vasopressin` v
         RIGHT  JOIN `mimic-iv-ext-2025.FAI_Sepsis.septic_hfref_full_26` s
           ON v.stay_id = s.stay_id
 )
@@ -2214,6 +1723,7 @@ FROM vasopressin vaso
 GROUP BY vaso.stay_id;
 
 --Merging all of our pressor datasets to our main dataset--
+
 CREATE OR REPLACE TABLE `mimic-iv-ext-2025.FAI_Sepsis.septic_hfref_full_27` AS
 SELECT s.*,
        dobut.day1_dobutamine, dobut.day2_dobutamine, dobut.day3_dobutamine, dobut.day4_dobutamine, dobut.day5_dobutamine, dobut.day6_dobutamine, dobut.day7_dobutamine,
@@ -2235,7 +1745,7 @@ FROM `mimic-iv-ext-2025.FAI_Sepsis.septic_hfref_full_26` s
 
 
 
-##########################Step 13: Bringing in NED##########################
+##########################Bringing in NED##########################
 
 --Selecting the maximum NED on days 1-7 for each patient--
 --Day 1--
@@ -2356,7 +1866,7 @@ FROM `mimic-iv-ext-2025.FAI_Sepsis.septic_hfref_full_27` s
                             ON s.stay_id = d7.stay_id;
 
 
-##########################Step 14: Sepsis timing flag##########################
+##########################Sepsis timing flag##########################
 
 --Generating flag to determine if each patient had SOFA 2+ and suspicion of infection in the first 48 hours of ICU stay--
 CREATE OR REPLACE TABLE `mimic-iv-ext-2025.FAI_Sepsis.septic_hfref_full_29` AS
@@ -2373,7 +1883,10 @@ CASE
 
 
 
-##########################Step 15: Apply exclusion criteria##########################
+#########################Calculate fluid balance in the first 48 hours after sepsis onset as per Dong et al. code ##########################
+
+
+###Apply exclusion criteria###
 --ESRD 
 --ICU los <= 2.0 days
 --Prior AKI (note that only prior AKIs occurring at BIDMC will be captured)
@@ -2387,3 +1900,357 @@ WHERE (s.sofa_sepsis_first48=1 AND s.susp_infection_first48=1 AND s.ned_received
   FROM `physionet-data.mimiciv_3_1_hosp.diagnoses_icd` d 
     WHERE LOWER(d.icd_code) IN ("40301","40311","40391","40402","40403","40412","40413","40492","40493",
     "5855","5856","i120","i1311","i132","n185","n186"))); --Final study population--
+
+
+--Creating a dataset with our analytic sample that includes sepsis onset time--
+
+CREATE OR REPLACE TABLE `mimic-iv-ext-2025.FAI_Sepsis.analytic_sample` AS
+SELECT s.*, GREATEST(susp_infection_time_sepdx, sofa_time_sepdx) AS sepsis_onset_datetime
+FROM `mimic-iv-ext-2025.FAI_Sepsis.septic_hfref_full_29` s
+WHERE (s.sofa_sepsis_first48=1 AND s.susp_infection_first48=1 AND s.ned_received= 1 AND s.prior_AKI_flag= 0 AND s.los > 2.0 AND s.hadm_id NOT IN
+(SELECT DISTINCT d.hadm_id
+  FROM `physionet-data.mimiciv_3_1_hosp.diagnoses_icd` d 
+    WHERE LOWER(d.icd_code) IN ("40301","40311","40391","40402","40403","40412","40413","40492","40493",
+    "5855","5856","i120","i1311","i132","n185","n186"))); --Final study population--
+
+
+--All volumetric input events that occurred in our analytic sample--
+--We will reference this list in our modified fluid balance code from Dong et al--
+SELECT DISTINCT amountuom
+FROM `physionet-data.mimiciv_3_1_icu.inputevents` ;
+
+SELECT DISTINCT i.itemid, d.label
+FROM `physionet-data.mimiciv_3_1_icu.inputevents` i
+LEFT JOIN `physionet-data.mimiciv_3_1_icu.d_items` d
+  ON i.itemid = d.itemid
+WHERE i.stay_id IN(
+    SELECT DISTINCT s.stay_id
+        FROM `mimic-iv-ext-2025.FAI_Sepsis.analytic_sample` s)
+          AND i.amountuom in ('mL', 'L','nL', 'pL', 'µL' ); --Excluding itemid 226361 "Pre-Admission/Non-ICU Intake" from our list--
+
+
+
+--All output events that occurred in our analytic sample--
+--We will reference this list in our modified fluid balance code from Dong et al--
+SELECT DISTINCT o.itemid, d.label, o.valueuom
+FROM `physionet-data.mimiciv_3_1_icu.outputevents` o
+LEFT JOIN `physionet-data.mimiciv_3_1_icu.d_items` d
+  ON o.itemid = d.itemid
+WHERE o.stay_id IN(
+    SELECT DISTINCT s.stay_id
+        FROM `mimic-iv-ext-2025.FAI_Sepsis.analytic_sample` s); --Excluding itemid 226633 "Pre-Admission" from our list--
+
+--Outputevents table does not include hemodialysis outputs, so we will need to reference the chartevents table to incorporate these itemids--
+
+--Identifying dialysis itemids to then search in chartevents--
+SELECT *
+FROM physionet-data.mimiciv_3_1_icu.d_items
+WHERE LOWER (label) LIKE '%hemodial%'
+  OR LOWER (label) LIKE '%dialys%'
+  OR LOWER (label) LIKE '%ultrafi%'
+  OR LOWER (label) LIKE '%hd%';
+
+
+SELECT DISTINCT c.itemid, d.label, c.valueuom
+FROM `physionet-data.mimiciv_3_1_icu.chartevents` c
+LEFT JOIN `physionet-data.mimiciv_3_1_icu.d_items` d
+  ON c.itemid=d.itemid
+   WHERE d.itemid IN(226457, 226499); --Both charted in mLs--
+
+
+SELECT DISTINCT a.stay_id
+  FROM `mimic-iv-ext-2025.FAI_Sepsis.analytic_sample` a
+  LEFT JOIN `physionet-data.mimiciv_3_1_icu.chartevents` c
+  ON a.stay_id = c.stay_id
+  WHERE c.itemid IN (226457,226499)
+  AND c.charttime BETWEEN a.sepsis_onset_datetime AND (DATETIME_ADD(a.sepsis_onset_datetime,interval '2' DAY)); --Our analytic sample does have hemodialysis output charted, so we will need to update our fluid balance code to consider this--
+
+
+--Before running the fluid balance code, we need to create a modified icustays table that includes sepsis onset time--
+CREATE OR REPLACE TABLE  `mimic-iv-ext-2025.FAI_Sepsis.icustays_modified` AS
+  SELECT i.stay_id, a.sepsis_onset_datetime
+    FROM `physionet-data.mimiciv_3_1_icu.icustays` i
+    LEFT JOIN `mimic-iv-ext-2025.FAI_Sepsis.analytic_sample` a
+      ON i.stay_id = a.stay_id;
+
+
+  
+--Calculate fluid balance for each patient--
+--The following code has been modified from the Dong et al article: 
+--https://www.frontiersin.org/journals/medicine/articles/10.3389/fmed.2022.714384/full#supplementary-material--
+--1)All inclusion/exclusion criteria were applied
+--2)Pulled all inputevents item IDs that occurred in our analytic sample
+--3)Pulled all outputevents item IDs that occurred in our analytic sample
+--4)Modified the Dong et al. fluid balance code to use our population-specific input and output events
+CREATE OR REPLACE TABLE `mimic-iv-ext-2025.FAI_Sepsis.analytic_sample_fb_sepsis_onset` AS 
+with t1 as --t1 is inputevents within 2 days after sepsis onset 
+(select p1.stay_id, 
+        p1.starttime, 
+        p1.itemid,
+        p1.amountuom,
+        p1.ordercategoryname,
+        p1.secondaryordercategoryname,
+   round(case
+      when p1.amountuom='L' then p1.amount*1000
+                    when p1.amountuom='mL' then p1.amount
+                    else NULL end) as amount
+      from `physionet-data.mimiciv_3_1_icu.inputevents` p1 
+       left join `mimic-iv-ext-2025.FAI_Sepsis.icustays_modified` p2
+     on p1.stay_id = p2.stay_id 
+     where p1.starttime between p2.sepsis_onset_datetime and (DATETIME_ADD(p2.sepsis_onset_datetime,interval '2' DAY)) 
+),
+t2 as --t2 is dialysis outputs within 2 days after sepsis onset(chartevents)
+(select p1.stay_id, p1.itemid, p1.valuenum
+   from `physionet-data.mimiciv_3_1_icu.chartevents` p1
+    left join `mimic-iv-ext-2025.FAI_Sepsis.icustays_modified` p2
+      on p1.stay_id= p2.stay_id
+        where p1.charttime between p2.sepsis_onset_datetime and (DATETIME_ADD(p2.sepsis_onset_datetime,interval '2' DAY)) 
+),
+t3 as  --t3 is outputevents within 2 days after sepsis onset
+(select tmp.stay_id,tmp.charttime,tmp.itemid,tmp.label,tmp.value from
+  (select p1.stay_id,
+        p1.charttime,
+        p1.itemid,
+        p2.label,
+        p1.value
+       from `physionet-data.mimiciv_3_1_icu.outputevents` p1
+       left join `physionet-data.mimiciv_3_1_icu.d_items` p2
+     on p1.itemid = p2.itemid
+     ) tmp
+    left join `mimic-iv-ext-2025.FAI_Sepsis.icustays_modified` p3
+    on p3.stay_id = tmp.stay_id
+    where (tmp.charttime between p3.sepsis_onset_datetime and (DATETIME_ADD(p3.sepsis_onset_datetime,interval '2' DAY)) --within 2 days after sepsis onset time 
+          and tmp.stay_id in (select stay_id from `mimic-iv-ext-2025.FAI_Sepsis.analytic_sample`)) --select analytic sample
+ ),
+inev as(
+select stay_id, 
+       sum(case
+       when t1.itemid in (
+225799, --Gastric Meds
+225823, --D5 1/2NS
+225830, --Multivitamins
+226365, --OR Colloid Intake
+226372, --OR Cell Saver Intake
+227695, --Fibersource HN (Full)
+225930, --Peptamen 1.5 (Full)
+225931, --Nutren 2.0 (Full)
+227979, --Boost Glucose Control (Full)
+225168, --Packed Red Blood Cells
+225936, --Replete with Fiber (Full)
+229010, --Jevity 1.2 (Full)
+229013, --Glucerna 1.2 (Full)
+225943, --Solution
+225944, --Sterile Water
+229296, --Vital High Protein (Full)
+227522, --KCL (Bolus)
+220862, --Albumin 25%
+226375, --PACU Crystalloid Intake
+225916, --TPN w/ Lipids
+225170, --Platelets
+225920, --Peripheral Parenteral Nutrition
+226051, --Replete with Fiber (1/2)
+226370, --OR Autologous Blood Intake
+225174, --Hetastarch (Hespan) 6%
+225928, --Impact with Fiber (Full)
+228367, --Two Cal HN (Full)
+225825, --D5NS
+225828, --LR
+226089, --Piggyback
+225158, --NaCl 0.9%
+229012, --Vital 1.5 (Full)
+227533, --Sodium Bicarbonate 8.4% (Amp)
+229583, --Beneprotein
+227523, --Magnesium Sulfate (Bolus)
+220950, --Dextrose 10%
+225934, --Vivonex (Full)
+227973, --NovaSource Renal (1/2)
+228140, --Dextrose 20%
+226371, --OR Cryoprecipitate Intake
+225797, --Free Water
+228359, --Glucerna (Full)
+228135, --Isosource 1.5 (Full)
+220970, --Fresh Frozen Plasma
+226364, --OR Crystalloid Intake
+226367, --OR FFP Intake
+225171, --Cryoprecipitate
+229011, --Jevity 1.5 (Full)
+226453, --GT Flush
+229014, --Promote with Fiber (Full)
+229297, --Osmolite 1.5 (Full)
+227529, --ACD-A Citrate (1000ml)
+228351, --Nepro (Full)
+229574, --Fiber Supplement (i.e. Banana Flakes)
+225827, --D5LR
+226363, --Cath Lab Intake
+226368, --OR Packed RBC Intake
+226880, --Nutren Pulmonary (Full)
+221036, --Nutren Renal (Full)
+226050, --Replete with Fiber (3/4)
+227532, --Plasma Pheresis 
+228341, --NaCl 23.4%
+228363, --Pulmocare (Full)
+220949, --Dextrose 5%
+220952, --Dextrose 50%
+228383, --Peptamen Bariatric (Full)
+226369, --OR Platelet Intake
+225917, --TPN without Lipids
+227975, --NovaSource Renal (Full)
+225161, --NaCl 3% (Hypertonic Saline)
+225935, --Replete (Full)
+225937, --Ensure (Full)
+229009, --Promote (Full)
+226452, --PO Intake
+229295, --Glucerna 1.5 (Full)
+220864, --Albumin 5%
+229640, --Calcium Gluconate (Bolus)
+225159, --NaCl 0.45%
+227528, --ACD-A Citrate (500ml)
+226376, --PACU Colloid Intake
+225941 --D5 1/4NS    
+                                 ) then amount *1
+         else amount * 0 end) as total_in_sepsis_onset
+     from t1 group by t1.stay_id
+    ),
+chartev as( --dialysis outputs from chartevents table
+select stay_id, 
+       sum(case
+       when t2.itemid in (
+226457, --Ultrafiltrate Output
+226499  --Hemodialysis Output
+       ) then valuenum*1
+      else valuenum*0 end) as dialysis_out_sepsis_onset
+    from t2 group by t2.stay_id
+),
+outev as (
+----outputevents
+select t3.stay_id,
+       sum(case
+       when t3.itemid in ( 
+226559, --Foley
+226560, --Void
+226599, --Jackson Pratt #1
+226582, --Ostomy (output)
+226588, --Chest Tube #1
+226589, --Chest Tube #2
+226571, --Emesis
+226612, --Pericardial
+226583, --Rectal Tube
+226565, --L Nephrostomy
+226603, --T Tube
+226591, --L Pleural #2
+226608, --Cerebral Subdural #1
+227510, --TF Residual
+227511, --TF Residual Output
+226561, --Condom Cath
+226564, --R Nephrostomy
+227701, --Drainage Bag
+226626, --OR EBL
+226601, --Jackson Pratt #3
+226598, --JP Lateral
+226584, --Ileoconduit
+229413, --Chest Tube #3
+226614, --Wound Vac #2
+226613, --Wound Vac #1
+226567, --Straight Cath
+226592, --Mediastinal
+226619, --Pigtail #1
+227488, --GU Irrigant Volume In 
+226590, --L Pleural #1
+226593, --R Pleural #1
+226632, --Cath Lab
+226625, --Tap
+226574, --Jejunostomy
+226576, --Oral Gastric
+226575, --Nasogastric
+226580, --Fecal Bag
+226627, --OR Urine
+226579, --Stool
+227489, --GU Irrigant/Urine Volume Out
+226563, --Suprapubic
+226573, --Gastric Tube
+226600, --Jackson Pratt #2
+226604, --Hemovac #1
+226602, --Jackson Pratt #4
+226628, --PACU Drains
+226631, --PACU Urine
+226597, --JP Medial
+226595, --R Pleural #2
+226620, --Pigtail #2
+226630 --PACU Gastric
+         
+                         
+                   ) then value *1
+         else value * 0 end) as outputevents_sepsis_onset
+     from t3 group by stay_id 
+  )
+select p1.stay_id,total_in_sepsis_onset, (dialysis_out_sepsis_onset + outputevents_sepsis_onset) AS total_out_sepsis_onset
+from inev p1
+  join chartev p2 
+    on p1.stay_id = p2.stay_id
+  join outev p3
+ on p2.stay_id = p3.stay_id;
+
+ 
+--Manually calculating ins and outs for random patient that received dialysis to verify fluid balance code worked--
+SELECT *
+FROM `mimic-iv-ext-2025.FAI_Sepsis.analytic_sample`
+WHERE stay_id = 35531906; --sepsis onset: 2162-09-07T21:00:00--
+
+SELECT *
+FROM `mimic-iv-ext-2025.FAI_Sepsis.analytic_sample_fb_sepsis_onset`
+WHERE stay_id = 35531906; 
+
+SELECT *
+FROM `physionet-data.mimiciv_3_1_icu.inputevents` 
+WHERE  stay_id = 35531906 AND starttime BETWEEN  '2162-09-07T21:00:00' and '2162-09-09T21:00:00';
+
+SELECT *
+FROM `physionet-data.mimiciv_3_1_icu.outputevents` 
+WHERE stay_id = 35531906 AND charttime BETWEEN  '2162-09-07T21:00:00' and '2162-09-09T21:00:00';
+
+SELECT *
+FROM `physionet-data.mimiciv_3_1_icu.chartevents` 
+WHERE itemid IN (226457,226499)  AND stay_id = 35531906 AND charttime BETWEEN  '2162-09-07T21:00:00' and '2162-09-09T21:00:00' and valueuom = 'mL';
+
+--Manually calculating ins and outs for random patient that did not receive dialysis to verify fluid balance code worked--
+SELECT *
+FROM `mimic-iv-ext-2025.FAI_Sepsis.analytic_sample`
+WHERE stay_id = 39378254; --sepsis onset: 2117-11-10T18:25:00--
+
+SELECT *
+FROM `mimic-iv-ext-2025.FAI_Sepsis.analytic_sample_fb_sepsis_onset`
+WHERE stay_id = 39378254; 
+
+SELECT *
+FROM `physionet-data.mimiciv_3_1_icu.inputevents` 
+WHERE  stay_id = 39378254 AND starttime BETWEEN  '2117-11-10T18:25:00' and '2117-11-12T18:25:00';
+
+SELECT *
+FROM `physionet-data.mimiciv_3_1_icu.outputevents` 
+WHERE stay_id = 39378254 AND charttime BETWEEN  '2117-11-10T18:25:00' and '2117-11-12T18:25:00';
+
+SELECT *
+FROM `physionet-data.mimiciv_3_1_icu.chartevents` 
+WHERE itemid IN (226457,226499)  AND stay_id = 39378254 AND charttime BETWEEN  '2117-11-10T18:25:00' and '2117-11-12T18:25:00' and valueuom = 'mL';
+
+
+--Merging fluid balance data into dataset with all variables--
+
+
+CREATE OR REPLACE TABLE `mimic-iv-ext-2025.FAI_Sepsis.analytic_sample_final` AS
+SELECT a.*, f.total_in_sepsis_onset, f.total_out_sepsis_onset, (f.total_in_sepsis_onset - f.total_out_sepsis_onset) AS fb_sepsis_onset, ((f.total_in_sepsis_onset - f.total_out_sepsis_onset)/f.total_in_sepsis_onset) AS fai_sepsis_onset, DATETIME_DIFF(outtime, sepsis_onset_datetime, HOUR) AS hrs_between_sepsisonset_discharge
+  FROM `mimic-iv-ext-2025.FAI_Sepsis.analytic_sample` a
+  LEFT JOIN
+    `mimic-iv-ext-2025.FAI_Sepsis.analytic_sample_fb_sepsis_onset` f
+      ON a.stay_id = f.stay_id
+        LEFT JOIN `physionet-data.mimiciv_3_1_icu.icustays` i
+          ON a.stay_id = i.stay_id;
+
+
+SELECT COUNT(DISTINCT stay_id)
+  FROM `mimic-iv-ext-2025.FAI_Sepsis.analytic_sample_final`
+    WHERE fai_sepsis_onset <= 0.42;
+
+SELECT COUNT(DISTINCT stay_id)
+  FROM `mimic-iv-ext-2025.FAI_Sepsis.analytic_sample_final`
+    WHERE fai_sepsis_onset > 0.42;
